@@ -6651,6 +6651,12 @@ export const useQueryStore = defineStore("query", () => {
       executionTarget?: MultiDbExecutionTarget;
       onExecutionStarted?: () => void;
       batchResume?: BatchSqlResumeOptions;
+      /**
+       * 表数据刷新首查（星号投影）的失败接管：返回 true 时该次失败不发布错误结果、
+       * 保留当前结果，由调用方用最新列重建语句后重试。用于静默"列被别的会话删除 /
+       * 列级 SELECT 权限"这类本身不是故障的失败。
+       */
+      handoffColumnChangeError?: (error: unknown) => boolean;
     },
   ) {
     assertUpdateAllowsInteraction();
@@ -8078,6 +8084,21 @@ export const useQueryStore = defineStore("query", () => {
           // A failed background segment must not replace the visible result or
           // silently invalidate pending edits. The next explicit refresh can retry.
           queryExecutionLog("warn", "append-result:preserved-after-error", { traceId, elapsed: elapsed() });
+          return false;
+        }
+        let columnChangeHandedOff = false;
+        if (options?.handoffColumnChangeError && !current.isCancelling) {
+          try {
+            columnChangeHandedOff = options.handoffColumnChangeError(e) === true;
+          } catch (handoffError) {
+            // 接管回调自身出错不能影响错误发布：退化为常规错误结果
+            queryExecutionLog("warn", "column-change-error:handoff-failed", { traceId, elapsed: elapsed(), error: handoffError });
+          }
+        }
+        if (columnChangeHandedOff) {
+          // 调用方接管了这次失败（列被删/列级权限）：不发布错误结果，保留旧数据。
+          // 调用方随后会用最新列重建语句重试；重试失败会照常走到下面发布错误结果。
+          queryExecutionLog("warn", "column-change-error:handed-off", { traceId, elapsed: elapsed() });
           return false;
         }
         const errorResult = toErrorResult(e);

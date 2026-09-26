@@ -1530,4 +1530,41 @@ describe("queryStore multi-statement errors", () => {
     await expect(store.setActiveResultRun(importedId!, tab.resultRuns![0]!.id)).resolves.toBe(true);
     expect(tab.result?.rows).toEqual([[1]]);
   });
+
+  it("keeps the displayed result when the caller takes over a column-change failure", async () => {
+    mocks.executeMulti.mockRejectedValue(new Error('ORA-00904: "OLD_COL": invalid identifier'));
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "users", "data", "app");
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    const previousResult: QueryResult = { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 };
+    tab.result = previousResult;
+    const handoff = vi.fn(() => true);
+
+    await store.executeTabSql(tabId, "SELECT * FROM app.users", { preserveResultDuringExecution: true, handoffColumnChangeError: handoff });
+
+    expect(handoff).toHaveBeenCalledTimes(1);
+    // 接管后不发布错误结果：旧数据原样保留，调用方随后用新列重试
+    expect(tab.result?.columns).toEqual(previousResult.columns);
+    expect(tab.result?.rows).toEqual(previousResult.rows);
+    expect(tab.result?.execution_error).toBeUndefined();
+    expect(tab.isExecuting).toBe(false);
+  });
+
+  it("publishes the error result when the caller declines the column-change handoff", async () => {
+    mocks.executeMulti.mockRejectedValue(new Error('ORA-00904: "OLD_COL": invalid identifier'));
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "users", "data", "app");
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    tab.result = { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 };
+    const handoff = vi.fn(() => false);
+
+    await store.executeTabSql(tabId, "SELECT * FROM app.users", { preserveResultDuringExecution: true, handoffColumnChangeError: handoff });
+
+    expect(handoff).toHaveBeenCalledTimes(1);
+    // 调用方未接管（例如断链类失败）：错误结果照常发布到界面
+    expect(tab.result?.execution_error).toBe(true);
+    expect(tab.result?.columns).toEqual(["Error"]);
+  });
 });

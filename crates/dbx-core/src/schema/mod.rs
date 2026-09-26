@@ -46,33 +46,48 @@ async fn clone_metadata_pool(state: &AppState, pool_key: &str) -> Option<PoolKin
     state.pool_handle(pool_key).await
 }
 
-struct EphemeralAgentMetadataSession {
+/// Isolation marker for Agent-backed metadata work.
+///
+/// The session id is stable per (connection, task kind) instead of a fresh uuid
+/// per request, so consecutive metadata calls of the same kind reuse one Agent
+/// session — and therefore one physical database connection.
+///
+/// Agent drivers (Oracle, Dameng, Hive, …) pay a full login per session, and over
+/// a high-latency transport such as an SSH tunnel that login is dozens of round
+/// trips. Refreshing a single table used to create a new session for every
+/// metadata facet (`getColumns` / `listIndexes` / `listForeignKeys`), so the user
+/// paid several logins per interaction.
+///
+/// Distinct task kinds deliberately keep distinct sessions: unrelated facets must
+/// still be able to run in parallel instead of queueing behind the single
+/// connection mutex of `PoolKind::Agent`. The pool outlives the request and is
+/// released once it has been idle (see
+/// `AppState::schedule_metadata_session_pool_release`) or when the connection is
+/// disconnected.
+struct AgentMetadataSession {
     client_session_id: Option<String>,
-    cleanup_guard: Option<crate::connection::ClientSessionPoolCleanupGuard>,
 }
 
-impl EphemeralAgentMetadataSession {
+impl AgentMetadataSession {
     async fn open(state: &AppState, connection_id: &str, database: Option<&str>, task_kind: &str) -> Self {
         let db_config = connection_config(state, connection_id).await;
-        let client_session_id = ephemeral_agent_metadata_session_id(db_config.as_ref(), task_kind);
-        let cleanup_guard = match client_session_id.as_deref() {
-            Some(client_session_id) => {
-                state.metadata_session_pool_cleanup_guard(connection_id, database, client_session_id).await
-            }
-            None => None,
-        };
-        Self { client_session_id, cleanup_guard }
+        let client_session_id = agent_metadata_session_id(db_config.as_ref(), connection_id, task_kind);
+        if let Some(client_session_id) = client_session_id.as_deref() {
+            // A pending idle release must not fire while this request is running.
+            state.cancel_metadata_session_pool_release(connection_id, database, client_session_id).await;
+        }
+        Self { client_session_id }
     }
 
     fn client_session_id(&self) -> Option<&str> {
         self.client_session_id.as_deref()
     }
 
-    async fn finish(mut self, state: &AppState, connection_id: &str, database: Option<&str>) {
-        if close_ephemeral_agent_metadata_session(state, connection_id, database, self.client_session_id()).await {
-            if let Some(cleanup_guard) = self.cleanup_guard.as_mut() {
-                cleanup_guard.disarm();
-            }
+    /// Hand the session back for reuse: schedule the idle release instead of
+    /// tearing the pool down, so the next metadata request skips the login.
+    async fn release(self, state: &AppState, connection_id: &str, database: Option<&str>) {
+        if let Some(client_session_id) = self.client_session_id.as_deref() {
+            state.schedule_metadata_session_pool_release(connection_id, database, client_session_id).await;
         }
     }
 }
@@ -982,7 +997,7 @@ pub async fn list_tables_core(
     object_types: Option<&[String]>,
     table_name_filter: Option<&TableNameFilter>,
 ) -> Result<Vec<db::TableInfo>, String> {
-    let metadata_session = EphemeralAgentMetadataSession::open(state, connection_id, Some(database), "tables").await;
+    let metadata_session = AgentMetadataSession::open(state, connection_id, Some(database), "tables").await;
     let result = retry_metadata_connection_for_session(
         state,
         connection_id,
@@ -1004,7 +1019,7 @@ pub async fn list_tables_core(
         },
     )
     .await;
-    metadata_session.finish(state, connection_id, Some(database)).await;
+    metadata_session.release(state, connection_id, Some(database)).await;
     result
 }
 
@@ -1114,8 +1129,7 @@ pub async fn get_table_comment_core(
         return Err("Table comments are not available for linked server tables".to_string());
     }
 
-    let metadata_session =
-        EphemeralAgentMetadataSession::open(state, connection_id, Some(database), "table-comment").await;
+    let metadata_session = AgentMetadataSession::open(state, connection_id, Some(database), "table-comment").await;
     let result = get_table_comment_core_for_session(
         state,
         connection_id,
@@ -1125,7 +1139,7 @@ pub async fn get_table_comment_core(
         metadata_session.client_session_id(),
     )
     .await;
-    metadata_session.finish(state, connection_id, Some(database)).await;
+    metadata_session.release(state, connection_id, Some(database)).await;
     result
 }
 
@@ -3126,15 +3140,15 @@ mod tests {
     use super::agent_postgres_extension_fallback_config;
     use super::db;
     use super::{
-        clickhouse_metadata_database, dameng_object_statistics_dba_segments_sql,
+        agent_metadata_session_id, clickhouse_metadata_database, dameng_object_statistics_dba_segments_sql,
         dameng_object_statistics_rows_only_sql, dameng_object_statistics_user_segments_sql, deduplicate_column_infos,
-        ephemeral_agent_metadata_session_id, external_driver_statistics_dialect, external_driver_statistics_query_plan,
-        external_driver_uses_generic_ddl, external_driver_uses_mysql_ddl, filter_mongodb_agent_collections,
-        filter_mysql_system_databases_for_config, filter_object_infos, filter_table_infos, filter_visible_schema_names,
-        finalize_object_source, gaussdb_m_view_object_source_sql, gbase8a_object_statistics_sql,
-        is_agent_postgres_metadata_fallback_config, is_mysql_external_driver_config, is_oracle_external_driver_config,
-        is_retryable_metadata_error, metadata_error_action, metadata_name_or_comment_matches,
-        mysql_database_list_timeout, mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
+        external_driver_statistics_dialect, external_driver_statistics_query_plan, external_driver_uses_generic_ddl,
+        external_driver_uses_mysql_ddl, filter_mongodb_agent_collections, filter_mysql_system_databases_for_config,
+        filter_object_infos, filter_table_infos, filter_visible_schema_names, finalize_object_source,
+        gaussdb_m_view_object_source_sql, gbase8a_object_statistics_sql, is_agent_postgres_metadata_fallback_config,
+        is_mysql_external_driver_config, is_oracle_external_driver_config, is_retryable_metadata_error,
+        metadata_error_action, metadata_name_or_comment_matches, mysql_database_list_timeout,
+        mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
         mysql_object_source_ddl_column_index, mysql_object_source_sql, mysql_table_list_source_for_config,
         mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_columns_from_query_result,
         oracle_columns_sql, oracle_columns_sql_for_resolved_owner, oracle_completion_synonyms_sql,
@@ -3520,17 +3534,25 @@ mod tests {
     }
 
     #[test]
-    fn agent_metadata_uses_unique_ephemeral_sessions_only_for_agents() {
+    fn agent_metadata_sessions_are_stable_per_task_and_only_for_agents() {
         let oracle = test_connection_config(DatabaseType::Oracle);
-        let first = ephemeral_agent_metadata_session_id(Some(&oracle), "completion-objects").unwrap();
-        let second = ephemeral_agent_metadata_session_id(Some(&oracle), "completion-objects").unwrap();
+        let columns = agent_metadata_session_id(Some(&oracle), "conn-1", "columns").unwrap();
+        let repeated = agent_metadata_session_id(Some(&oracle), "conn-1", "columns").unwrap();
 
-        assert_ne!(first, second);
-        assert!(first.starts_with("completion-objects:"));
+        // Stable per (connection, task kind): repeated requests reuse one Agent
+        // session, which is what lets them skip the database login.
+        assert_eq!(columns, repeated);
+        assert!(columns.starts_with("metadata-columns:"));
+
+        // Distinct task kinds keep distinct sessions so unrelated facets can
+        // still run in parallel.
+        assert_ne!(columns, agent_metadata_session_id(Some(&oracle), "conn-1", "indexes").unwrap());
+        // Distinct connections never share a session.
+        assert_ne!(columns, agent_metadata_session_id(Some(&oracle), "conn-2", "columns").unwrap());
 
         let postgres = test_connection_config(DatabaseType::Postgres);
-        assert!(ephemeral_agent_metadata_session_id(Some(&postgres), "completion-objects").is_none());
-        assert!(ephemeral_agent_metadata_session_id(None, "completion-objects").is_none());
+        assert!(agent_metadata_session_id(Some(&postgres), "conn-1", "columns").is_none());
+        assert!(agent_metadata_session_id(None, "conn-1", "columns").is_none());
     }
 
     #[test]
@@ -6370,7 +6392,7 @@ pub async fn list_objects_core(
     let use_oracle_agent_paging = db_config.as_ref().is_some_and(is_default_oracle_agent_config)
         && !filter_locally_after_oracle_comments
         && !force_local_table_name_filter;
-    let metadata_session = EphemeralAgentMetadataSession::open(state, connection_id, Some(database), "objects").await;
+    let metadata_session = AgentMetadataSession::open(state, connection_id, Some(database), "objects").await;
     let result = retry_metadata_connection_for_session(
         state,
         connection_id,
@@ -6404,7 +6426,7 @@ pub async fn list_objects_core(
         },
     )
     .await;
-    metadata_session.finish(state, connection_id, Some(database)).await;
+    metadata_session.release(state, connection_id, Some(database)).await;
     result
 }
 
@@ -6426,8 +6448,7 @@ pub async fn list_completion_objects_core(
     database: &str,
     schema: &str,
 ) -> Result<Vec<db::ObjectInfo>, String> {
-    let metadata_session =
-        EphemeralAgentMetadataSession::open(state, connection_id, Some(database), "completion-objects").await;
+    let metadata_session = AgentMetadataSession::open(state, connection_id, Some(database), "completion-objects").await;
     let result = retry_metadata_connection_for_session(
         state,
         connection_id,
@@ -6436,34 +6457,25 @@ pub async fn list_completion_objects_core(
         || list_completion_objects_once(state, connection_id, database, schema, metadata_session.client_session_id()),
     )
     .await;
-    metadata_session.finish(state, connection_id, Some(database)).await;
+    metadata_session.release(state, connection_id, Some(database)).await;
     result
 }
 
-fn ephemeral_agent_metadata_session_id(config: Option<&ConnectionConfig>, task_kind: &str) -> Option<String> {
+/// Session id for one Agent metadata task kind of a connection.
+///
+/// Stable per (connection, task kind) — deliberately *not* a fresh uuid — so
+/// consecutive metadata requests reuse the same Agent session and skip the
+/// database login. Different task kinds still get different sessions so
+/// independent facets can run concurrently instead of queueing behind one
+/// connection's mutex.
+fn agent_metadata_session_id(
+    config: Option<&ConnectionConfig>,
+    connection_id: &str,
+    task_kind: &str,
+) -> Option<String> {
     config
         .filter(|config| crate::database_capabilities::is_agent_type(&config.db_type))
-        .map(|_| task_client_session_id(task_kind, &uuid::Uuid::new_v4().to_string()))
-}
-
-async fn close_ephemeral_agent_metadata_session(
-    state: &AppState,
-    connection_id: &str,
-    database: Option<&str>,
-    client_session_id: Option<&str>,
-) -> bool {
-    let Some(client_session_id) = client_session_id else {
-        return true;
-    };
-    match state.close_metadata_session_pool(connection_id, database, client_session_id).await {
-        Ok(_) => true,
-        Err(error) => {
-            log::warn!(
-                "Failed to close ephemeral Agent metadata session '{client_session_id}' for '{connection_id}': {error}"
-            );
-            false
-        }
-    }
+        .map(|_| task_client_session_id(&format!("metadata-{task_kind}"), connection_id))
 }
 
 pub async fn completion_assistant_search_core(
@@ -7628,8 +7640,7 @@ pub async fn get_columns_core_for_session(
         return Box::pin(mongodb_columns::get_columns(state, connection_id, database, table)).await;
     }
     if client_session_id.is_none() {
-        let metadata_session =
-            EphemeralAgentMetadataSession::open(state, connection_id, Some(database), "columns").await;
+        let metadata_session = AgentMetadataSession::open(state, connection_id, Some(database), "columns").await;
         if metadata_session.client_session_id().is_some() {
             let result = get_columns_core_for_session_inner(
                 state,
@@ -7641,7 +7652,7 @@ pub async fn get_columns_core_for_session(
                 false,
             )
             .await;
-            metadata_session.finish(state, connection_id, Some(database)).await;
+            metadata_session.release(state, connection_id, Some(database)).await;
             return result;
         }
     }
@@ -8134,7 +8145,7 @@ pub async fn list_indexes_core(
     if crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema).is_some() {
         return Ok(vec![]);
     }
-    let metadata_session = EphemeralAgentMetadataSession::open(state, connection_id, Some(database), "indexes").await;
+    let metadata_session = AgentMetadataSession::open(state, connection_id, Some(database), "indexes").await;
     let result = list_indexes_core_for_session(
         state,
         connection_id,
@@ -8144,7 +8155,7 @@ pub async fn list_indexes_core(
         metadata_session.client_session_id(),
     )
     .await;
-    metadata_session.finish(state, connection_id, Some(database)).await;
+    metadata_session.release(state, connection_id, Some(database)).await;
     result
 }
 
@@ -8296,8 +8307,7 @@ pub async fn list_foreign_keys_core(
     if crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema).is_some() {
         return Ok(vec![]);
     }
-    let metadata_session =
-        EphemeralAgentMetadataSession::open(state, connection_id, Some(database), "foreign-keys").await;
+    let metadata_session = AgentMetadataSession::open(state, connection_id, Some(database), "foreign-keys").await;
     let result = list_foreign_keys_core_for_session(
         state,
         connection_id,
@@ -8307,7 +8317,7 @@ pub async fn list_foreign_keys_core(
         metadata_session.client_session_id(),
     )
     .await;
-    metadata_session.finish(state, connection_id, Some(database)).await;
+    metadata_session.release(state, connection_id, Some(database)).await;
     result
 }
 

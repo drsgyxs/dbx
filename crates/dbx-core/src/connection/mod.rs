@@ -68,6 +68,14 @@ const HEALTH_CHECK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const METADATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const METADATA_POOL_DEFAULT_LIMIT: usize = 6;
 pub(crate) const METADATA_POOL_SQLSERVER_LIMIT: usize = 1;
+/// Idle grace period for a reused Agent metadata session pool.
+///
+/// Agent metadata requests share one session per (connection, task kind) so
+/// they do not pay a fresh database login (tens of round trips over an SSH
+/// tunnel) on every call. Releasing the pool this long after its last use keeps
+/// that reuse bounded: walking away from a connection still frees its extra
+/// database sessions.
+const METADATA_SESSION_IDLE_TTL: Duration = Duration::from_secs(120);
 
 mod duckdb_types {
     #[cfg(feature = "duckdb-sidecar")]
@@ -4593,19 +4601,72 @@ impl AppState {
         Ok(true)
     }
 
-    pub(crate) async fn metadata_session_pool_cleanup_guard(
+    /// Pool key of the session-scoped pool backing one Agent metadata session.
+    ///
+    /// `None` when session scoping collapses into the shared base pool.
+    async fn metadata_session_pool_key(
         &self,
         connection_id: &str,
         database: Option<&str>,
         client_session_id: &str,
-    ) -> Option<ClientSessionPoolCleanupGuard> {
-        self.client_session_pool_cleanup_guard_for_role(
-            connection_id,
-            database,
-            client_session_id,
+    ) -> Option<String> {
+        let config = {
+            let configs = self.configs.read().await;
+            configs.get(connection_id).cloned()
+        };
+        let db_type = config.as_ref().map(|config| config.db_type);
+        let pool_database = metadata_pool_database(config.as_ref(), database);
+        let base_pool_key = base_pool_key_for(db_type, connection_id, pool_database, false);
+        let pool_key = pool_key_for_session_role(
+            config.as_ref(),
+            base_pool_key.clone(),
+            Some(client_session_id),
             AgentSessionRole::Metadata,
-        )
-        .await
+        );
+        (pool_key != base_pool_key).then_some(pool_key)
+    }
+
+    /// Cancel a scheduled idle release so the next metadata request reuses the
+    /// still-live Agent session instead of logging in again.
+    pub(crate) async fn cancel_metadata_session_pool_release(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: &str,
+    ) {
+        let Some(pool_key) = self.metadata_session_pool_key(connection_id, database, client_session_id).await else {
+            return;
+        };
+        self.task_supervisor.stop(&metadata_session_release_task_key(&pool_key));
+    }
+
+    /// Release the Agent metadata session pool once it has been idle for
+    /// [`METADATA_SESSION_IDLE_TTL`] instead of tearing it down at the end of
+    /// every request.
+    ///
+    /// Reusing the session removes the per-call database login; the delayed
+    /// release keeps that bounded so an idle connection does not hold extra
+    /// database sessions forever.
+    pub(crate) async fn schedule_metadata_session_pool_release(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: &str,
+    ) {
+        let Some(pool_key) = self.metadata_session_pool_key(connection_id, database, client_session_id).await else {
+            return;
+        };
+        let task_key = metadata_session_release_task_key(&pool_key);
+        let routing = self.pool_routing_control();
+        let release_key = pool_key.clone();
+        self.task_supervisor.spawn_once(task_key, move |cancel| async move {
+            tokio::select! {
+                _ = tokio::time::sleep(METADATA_SESSION_IDLE_TTL) => {}
+                _ = cancel.cancelled() => return,
+            }
+            log::debug!("Releasing idle Agent metadata session pool '{release_key}'");
+            routing.detach_pool_by_key(&release_key, false).await;
+        });
     }
 
     pub(crate) async fn workload_session_pool_cleanup_guard(
@@ -6302,6 +6363,11 @@ fn session_scoped_pool_key(base_pool_key: String, client_session_id: Option<&str
     normalize_client_session_id(client_session_id)
         .map(|session| format!("{base_pool_key}:session:{session}"))
         .unwrap_or(base_pool_key)
+}
+
+/// Supervisor key for the delayed release of a reused Agent metadata session pool.
+fn metadata_session_release_task_key(pool_key: &str) -> String {
+    format!("metadata-session-release:{pool_key}")
 }
 
 fn is_session_scoped_pool_key(pool_key: &str) -> bool {

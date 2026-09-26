@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   queryResultMaxRows: 10_000,
   tabs: [] as QueryTab[],
   setTableMeta: vi.fn(),
+  setErrorResult: vi.fn(),
   clearInvalidDataTabSort: vi.fn(),
   activeResultExecutionTarget: vi.fn(),
   lookupLocalCompletionTables: vi.fn(),
@@ -61,6 +62,7 @@ vi.mock("@/stores/queryStore", () => ({
     activeResultExecutionTarget: mocks.activeResultExecutionTarget,
     setExecuting: mocks.setExecuting,
     updateSql: mocks.updateSql,
+    setErrorResult: mocks.setErrorResult,
     tabs: mocks.tabs,
     clearInvalidDataTabSort: mocks.clearInvalidDataTabSort.mockImplementation((id: string) => {
       const tab = mocks.tabs.find((item) => item.id === id);
@@ -156,7 +158,7 @@ describe("useDataGridActions", () => {
     mocks.listIndexes.mockResolvedValue([]);
   });
 
-  it("manual refresh starts cache deletion without waiting and builds SQL from fresh columns", async () => {
+  it("manual refresh queries with a star projection first and only aligns the SQL text for a changed projection", async () => {
     const tab = tableDataTab();
     mocks.tabs.push(tab);
     let release!: () => void;
@@ -165,7 +167,8 @@ describe("useDataGridActions", () => {
         release = resolve;
       }),
     );
-    mocks.getColumns.mockResolvedValue([...tab.tableMeta!.columns, { name: "added", data_type: "text", is_nullable: true }]);
+    mocks.getColumns.mockResolvedValue([...tab.tableMeta!.columns, { name: "added", data_type: "integer", is_nullable: true }]);
+    mocks.buildTableSelectSql.mockResolvedValueOnce("SELECT * FROM public.users LIMIT 25 OFFSET 50").mockResolvedValue('SELECT "id", "added" FROM public.users LIMIT 25 OFFSET 50');
     const actions = useDataGridActions(computed(() => tab));
     const reload = actions.onReloadData(tab.id, tab.sql, "", "", "", 25, 50, "refresh");
     await vi.waitFor(() => expect(mocks.deleteSchemaCachePrefix).toHaveBeenCalledWith("object-meta:v1:postgres-1:app:public:users:"));
@@ -173,25 +176,115 @@ describe("useDataGridActions", () => {
     await vi.waitFor(() => expect(mocks.getColumns).toHaveBeenCalledTimes(1));
     release();
     await reload;
-    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: ["id", "added"], limit: 25, offset: 50 }));
+
+    // 首查不列任何列名（星号投影）：结果自带最新列，别人新增/删除列都不会先显示旧列
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: undefined, starProjection: true, limit: 25, offset: 50 }));
+    expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
+    expect(mocks.executeTabSql).toHaveBeenCalledWith(tab.id, "SELECT * FROM public.users LIMIT 25 OFFSET 50", expect.anything());
+    // 列集合变化后不重跑数据，只把编辑器 SQL 文本对齐到规范投影（分页参数保持一致）
+    await vi.waitFor(() => expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: ["id", "added"], limit: 25, offset: 50 })));
+    await vi.waitFor(() => expect(mocks.updateSql).toHaveBeenCalledWith(tab.id, 'SELECT "id", "added" FROM public.users LIMIT 25 OFFSET 50'));
+    expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
   });
 
-  it("manual refresh keeps index discovery off the awaited path", async () => {
+  it("manual refresh waits for fresh columns when the table needs large-value previews", async () => {
+    const tab = tableDataTab({
+      tableMeta: {
+        schema: "public",
+        tableName: "users",
+        tableType: "TABLE",
+        columns: [
+          { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+          { name: "doc", data_type: "text", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+        ],
+        primaryKeys: ["id"],
+      },
+    });
+    mocks.tabs.push(tab);
+    mocks.getColumns.mockResolvedValue(tab.tableMeta!.columns);
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
+
+    // 大字段预览按列类型裁剪，星号投影无法表达：必须先等新列/新类型，再发一条规范投影查询
+    expect(mocks.getColumns).toHaveBeenCalledTimes(1);
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: ["id", "doc"], starProjection: false }));
+    expect(mocks.buildTableSelectSql.mock.invocationCallOrder[0]!).toBeGreaterThan(mocks.getColumns.mock.invocationCallOrder[0]!);
+    expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
+  });
+
+  it("manual refresh re-executes once when the fresh columns newly require large-value previews", async () => {
+    const tab = tableDataTab({
+      tableMeta: {
+        schema: "public",
+        tableName: "users",
+        tableType: "TABLE",
+        columns: [
+          { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+          { name: "amount", data_type: "integer", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+        ],
+        primaryKeys: ["id"],
+      },
+    });
+    mocks.tabs.push(tab);
+    // 旧元数据里没有需要预览的列 → 首查用星号投影；本次新增了 text 列 → 必须补一条规范投影
+    mocks.getColumns.mockResolvedValue([...tab.tableMeta!.columns, { name: "doc", data_type: "text", is_nullable: true }]);
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
+    await vi.waitFor(() => expect(mocks.executeTabSql).toHaveBeenCalledTimes(2));
+
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: undefined, starProjection: true }));
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: ["id", "amount", "doc"] }));
+  });
+
+  it("manual refresh silently retries with the canonical projection after a dropped-column failure", async () => {
     const tab = tableDataTab();
     mocks.tabs.push(tab);
-    let releaseIndexes!: (indexes: unknown[]) => void;
-    mocks.listIndexes.mockReturnValueOnce(
-      new Promise((resolve) => {
-        releaseIndexes = resolve;
-      }),
-    );
+    mocks.executeTabSql.mockImplementation(async (_id: string, _sql: string, options?: { handoffColumnChangeError?: (error: unknown) => boolean }) => {
+      options?.handoffColumnChangeError?.(new Error('ORA-00904: "OLD": invalid identifier'));
+    });
     const actions = useDataGridActions(computed(() => tab));
-    const reload = actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
-    await reload;
-    // 等待段只拉列：SQL 已构建执行，listIndexes 仍未结算
+
+    await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
+
+    // 星号投影失败属于"列变化"→ 不上屏；用规范投影重试一次，且重试不再带接管回调
+    // （重试若仍失败，错误会照常发布，不会被静默）
+    const calls = mocks.executeTabSql.mock.calls;
+    expect(calls).toHaveLength(2);
+    expect((calls[1]![2] as { handoffColumnChangeError?: unknown } | undefined)?.handoffColumnChangeError).toBeUndefined();
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: undefined, starProjection: true }));
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: ["id"] }));
+    expect(mocks.setErrorResult).not.toHaveBeenCalled();
+  });
+
+  it("manual refresh does not retry when a star query fails for a non-column reason", async () => {
+    const tab = tableDataTab();
+    mocks.tabs.push(tab);
+    mocks.executeTabSql.mockImplementation(async (_id: string, _sql: string, options?: { handoffColumnChangeError?: (error: unknown) => boolean }) => {
+      options?.handoffColumnChangeError?.(new Error("Connection reset by peer"));
+    });
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
+
+    // 断链类失败不属于"列变化"：不接管、不重试（错误照常由执行层发布）
     expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
-    expect(mocks.listIndexes).toHaveBeenCalledTimes(1);
-    releaseIndexes([]);
+    expect(mocks.setErrorResult).not.toHaveBeenCalled();
+  });
+
+  it("manual refresh skips index discovery when the fresh columns already carry the primary key", async () => {
+    const tab = tableDataTab();
+    mocks.tabs.push(tab);
+    const actions = useDataGridActions(computed(() => tab));
+    await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
+    await vi.waitFor(() => expect(tab.tableMetaPending).toBe(false));
+
+    expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
+    expect(mocks.getColumns).toHaveBeenCalledTimes(1);
+    // 列自带真实主键 => 行标识由列确定，索引既不改行标识也不改 SQL 投影：
+    // 整段索引发现（慢链路上一整条新连接 + 数秒往返）必须不发
+    expect(mocks.listIndexes).not.toHaveBeenCalled();
   });
 
   it("manual refresh derives primary keys from fresh columns", async () => {
@@ -201,8 +294,8 @@ describe("useDataGridActions", () => {
     mocks.getColumns.mockResolvedValue([{ name: "id2", data_type: "bigint", is_nullable: false, column_default: null, is_primary_key: true, extra: null }]);
     const actions = useDataGridActions(computed(() => tab));
     await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
-    // 旧 PK 不在新列中：等待段不得把失效 PK 写回 tab 元数据
-    expect(tab.tableMeta?.primaryKeys).toEqual(["id2"]);
+    // 旧 PK 不在新列中：刷新不再串行等元数据，新列在后台落地后写回（不得保留失效 PK）
+    await vi.waitFor(() => expect(tab.tableMeta?.primaryKeys).toEqual(["id2"]));
   });
 
   it.each([true, false])("keeps a surviving old key read-only until index discovery settles (success=%s)", async (success) => {
@@ -223,7 +316,8 @@ describe("useDataGridActions", () => {
 
     expect(mocks.executeTabSql).toHaveBeenCalledOnce();
     expect(tab.tableMetaPending).toBe(true);
-    expect(tab.tableMeta?.primaryKeys).toEqual([]);
+    // 新列（无主键）落地后才有资格进入索引发现：这里等它落地
+    await vi.waitFor(() => expect(tab.tableMeta?.primaryKeys).toEqual([]));
     if (success) {
       resolveIndexes([]);
       await vi.waitFor(() => expect(tab.tableMetaPending).toBe(false));
@@ -252,7 +346,7 @@ describe("useDataGridActions", () => {
 
     await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
     expect(tab.tableMetaPending).toBe(true);
-    expect(tab.tableMeta?.primaryKeys).toEqual([]);
+    await vi.waitFor(() => expect(tab.tableMeta?.primaryKeys).toEqual([]));
     resolveIndexes([{ name: "users_id_unique", columns: ["id"], is_unique: true, is_primary: false }]);
     await vi.waitFor(() => expect(tab.tableMetaPending).toBe(false));
     expect(tab.tableMeta?.primaryKeys).toEqual(["id"]);
@@ -289,15 +383,20 @@ describe("useDataGridActions", () => {
     expect(tab.tableMeta?.primaryKeys).toEqual(tableType === "TABLE" ? ["__DBX_ROWID"] : []);
   });
 
-  it("keeps old metadata read-only when fresh columns fail", async () => {
+  it("keeps old metadata read-only when fresh columns fail but still refreshes the data", async () => {
     const tab = tableDataTab();
     mocks.tabs.push(tab);
     mocks.getColumns.mockRejectedValueOnce(new Error("columns failed"));
     const actions = useDataGridActions(computed(() => tab));
 
-    await expect(actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh")).rejects.toThrow("columns failed");
+    // 列刷新已移出关键路径：它失败不再中止本次刷新（数据仍要刷新），
+    // 但必须保持只读（行标识未知）并用星号投影执行，不得把旧元数据当成新结果。
+    await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
+
     expect(tab.tableMetaPending).toBe(true);
-    expect(mocks.executeTabSql).not.toHaveBeenCalled();
+    expect(tab.tableMeta?.primaryKeys).toEqual(["id"]);
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: undefined, starProjection: true }));
+    expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
   });
 
   it("preserves rows when cache deletion fails and still executes", async () => {
@@ -311,28 +410,41 @@ describe("useDataGridActions", () => {
     expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
   });
 
-  it("waits for fresh columns and suppresses a duplicate refresh", async () => {
+  it("suppresses a duplicate refresh while the first one is still executing, then aligns the SQL text for the new projection", async () => {
     const tab = tableDataTab();
     mocks.tabs.push(tab);
-    let release!: (columns: unknown[]) => void;
+    let releaseColumns!: (columns: unknown[]) => void;
     mocks.getColumns.mockReturnValueOnce(
       new Promise((resolve) => {
-        release = resolve;
+        releaseColumns = resolve;
+      }),
+    );
+    let releaseExecute!: () => void;
+    mocks.executeTabSql.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        releaseExecute = resolve;
       }),
     );
     const actions = useDataGridActions(computed(() => tab));
     const reload = actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
-    await vi.waitFor(() => expect(mocks.getColumns).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(mocks.executeTabSql).toHaveBeenCalledTimes(1));
+
+    // 第一跳仍在执行中：重复刷新必须被抑制（否则会重复打库）
+    const buildsBeforeDuplicate = mocks.buildTableSelectSql.mock.calls.length;
     await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
-    expect(mocks.buildTableSelectSql).not.toHaveBeenCalled();
-    release([{ ...tab.tableMeta!.columns[0], name: "renamed", data_type: "bigint" }]);
+    expect(mocks.buildTableSelectSql.mock.calls.length).toBe(buildsBeforeDuplicate);
+
+    releaseExecute();
     await reload;
+    releaseColumns([{ ...tab.tableMeta!.columns[0], name: "renamed", data_type: "bigint" }]);
+    // 列集合真的变化：首查结果已是最新列，不需要补跑；只对齐编辑器 SQL 文本并落地元数据
+    await vi.waitFor(() => expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: ["renamed"] })));
     expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
-    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: ["renamed"] }));
+    expect(mocks.getColumns).toHaveBeenCalledTimes(1);
     expect(tab.tableMeta!.columns[0].data_type).toBe("bigint");
   });
 
-  it("does not execute after the tab is replaced during metadata loading", async () => {
+  it("does not apply late metadata or re-execute after the tab was replaced", async () => {
     const tab = tableDataTab();
     mocks.tabs.push(tab);
     let release!: (columns: unknown[]) => void;
@@ -344,11 +456,16 @@ describe("useDataGridActions", () => {
     const actions = useDataGridActions(computed(() => tab));
     const reload = actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
     await vi.waitFor(() => expect(mocks.getColumns).toHaveBeenCalledTimes(1));
-    mocks.tabs.splice(0, 1, tableDataTab());
-    release(tab.tableMeta!.columns);
     await reload;
+    const executeCalls = mocks.executeTabSql.mock.calls.length;
+
+    // 标签页已被替换：晚到的元数据既不能写回，也不能触发补偿查询
+    mocks.tabs.splice(0, 1, tableDataTab());
+    release([...tab.tableMeta!.columns, { name: "added", data_type: "text", is_nullable: true, column_default: null, is_primary_key: false, extra: null }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
     expect(mocks.setTableMeta).not.toHaveBeenCalled();
-    expect(mocks.executeTabSql).not.toHaveBeenCalled();
+    expect(mocks.executeTabSql).toHaveBeenCalledTimes(executeCalls);
   });
 
   it("does not execute old SQL or clear a replacement tab's loading state after SQL generation", async () => {
@@ -408,7 +525,8 @@ describe("useDataGridActions", () => {
     await vi.waitFor(() => expect(mocks.getColumns).toHaveBeenCalledTimes(1));
     mocks.getColumns.mockResolvedValueOnce([...oldColumns, { ...oldColumns[0], name: "added" }]);
     await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
-    expect(tab.tableMeta!.columns.map((column) => column.name)).toEqual(["id", "added"]);
+    // 刷新不再串行等列：新列在后台刷新落地
+    await vi.waitFor(() => expect(tab.tableMeta!.columns.map((column) => column.name)).toEqual(["id", "added"]));
     release(oldColumns);
     // Drain the old metadata promise and its consumers.
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -863,7 +981,8 @@ describe("useDataGridActions", () => {
     await actions.onReloadData(tab.id, tab.sql, "", "", "", undefined, undefined, "auto-refresh");
 
     expect(mocks.getColumns).not.toHaveBeenCalled();
-    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: ["id"] }));
+    // 自动刷新与手动刷新共用同一套路径选择：同样用星号投影，不依赖旧列名
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ columns: undefined, starProjection: true }));
     expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
   });
 

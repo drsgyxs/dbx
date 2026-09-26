@@ -10,6 +10,7 @@ import {
   TABLE_DATA_CELL_PREVIEW_SIZE,
   TABLE_DATA_PREVIEW_CONTENT_MAX_BYTES,
   tableDataLargeValuePreviewOptions,
+  tableDataNeedsCanonicalProjection,
   tableDataVisiblePreviewContentBytes,
   tableDataVisiblePreviewRowRange,
 } from "@/lib/dataGrid/dataGridLargeValues";
@@ -57,6 +58,26 @@ describe("data grid large-value metadata", () => {
 
     expect(canUseTableDataLargeValuePreview("postgres", columns, ["id"])).toBe(false);
     expect(tableDataLargeValuePreviewOptions("postgres", columns, ["id"], 100)).toEqual({});
+  });
+
+  it("reports whether the canonical projection can differ from a star projection", () => {
+    // 非 mysql/postgres（含 Oracle）从不生成预览裁剪：规范投影与 SELECT * 完全等价
+    expect(tableDataNeedsCanonicalProjection("oracle", [column("id", "NUMBER", true), column("doc", "CLOB")], ["id"], 100)).toBe(false);
+    expect(tableDataNeedsCanonicalProjection("sqlite", [column("id", "integer", true), column("doc", "text")], ["id"], 100)).toBe(false);
+    // 没有主键时后端也不会生成预览投影
+    expect(tableDataNeedsCanonicalProjection("postgres", [column("doc", "text")], [], 100)).toBe(false);
+    // mysql：只有确实需要裁剪的列存在时才有差异
+    expect(tableDataNeedsCanonicalProjection("mysql", [column("id", "bigint", true), column("amount", "int")], ["id"], 100)).toBe(false);
+    expect(tableDataNeedsCanonicalProjection("mysql", [column("id", "bigint", true), column("payload", "longtext")], ["id"], 100)).toBe(true);
+    // postgres：text 类列会被 left(col, n) 裁剪
+    expect(tableDataNeedsCanonicalProjection("postgres", [column("id", "bigint", true), column("amount", "int")], ["id"], 100)).toBe(false);
+    expect(tableDataNeedsCanonicalProjection("postgres", [column("id", "bigint", true), column("doc", "text")], ["id"], 100)).toBe(true);
+    expect(tableDataNeedsCanonicalProjection("postgres", [column("id", "bigint", true), column("doc", "character varying(255)")], ["id"], 100)).toBe(true);
+    expect(tableDataNeedsCanonicalProjection("postgres", [column("id", "bigint", true), column("payload", "bytea")], ["id"], 100)).toBe(true);
+    // 主键列本身不参与裁剪（后端跳过 protected 列）
+    expect(tableDataNeedsCanonicalProjection("postgres", [column("doc", "text", true)], ["doc"], 100)).toBe(false);
+    // 数组类型没有 left(array, int) 重载，后端同样跳过
+    expect(tableDataNeedsCanonicalProjection("postgres", [column("id", "bigint", true), column("tags", "text[]")], ["id"], 100)).toBe(false);
   });
 
   it("shrinks each cell preview by serialized byte budget without changing page size", () => {

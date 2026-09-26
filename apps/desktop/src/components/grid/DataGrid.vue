@@ -11010,56 +11010,64 @@ async function refreshActiveTableInfo() {
   }
 }
 
-watch(
-  () => [props.connectionId, props.database, props.tableMeta?.catalog, props.tableMeta?.schema, props.tableMeta?.tableName],
-  () => {
-    tableInfoColumns.value = props.tableMeta?.columns ?? [];
-    tableInfoColumnsLoading.value = false;
-    tableInfoColumnsRequestGeneration.value += 1;
-    tableOwner.value = null;
-    tableOwnerLoading.value = false;
-    tableOwnerError.value = "";
-    tableOwnerRequestGeneration.value += 1;
-    tableOverviewStats.value = null;
-    tableOverviewComment.value = null;
-    tableOverviewLoading.value = false;
-    tableOverviewLoaded.value = false;
-    tableOverviewRequestGeneration.value += 1;
-    rawDdlContent.value = "";
-    indexes.value = [];
-    indexesLoaded.value = false;
-    indexesLoading.value = false;
-    indexesError.value = "";
-    indexesRequestGeneration.value += 1;
-    foreignKeys.value = [];
-    foreignKeysLoaded.value = false;
-    foreignKeysLoading.value = false;
-    foreignKeysError.value = "";
-    foreignKeysRequestGeneration.value += 1;
-    triggers.value = [];
-    triggersLoaded.value = false;
-    triggersError.value = "";
-    constraints.value = [];
-    constraintsLoaded.value = false;
-    constraintsLoading.value = false;
-    constraintsError.value = "";
-    constraintsRequestGeneration.value += 1;
-    partitioning.value = null;
-    partitioningLoaded.value = false;
-    partitioningLoading.value = false;
-    partitioningError.value = "";
-    partitioningRequestGeneration.value += 1;
-    isPartitionedTable.value = false;
-    partitionStatusResolved.value = false;
-    // 表身份变更后，主动触发索引加载，确保索引指示器在切换表后立即可见
-    if (showIndexIndicatorsInHeader.value && canShowTableIndexes.value && currentIndexTableIdentity.value) {
-      void fetchIndexes();
-    }
-    if (props.autoShowTableInfo && props.tableMeta) showTableInfo.value = true;
-    if (showTableInfo.value) selectTableInfoTab(activeTableInfoTab.value);
-    if (showTableInfo.value) void fetchTableOwner();
-  },
-);
+// 表身份（连接/库/catalog/schema/表名）的稳定字符串，专门给下面几个
+// "身份变化才重置"的 watch 当依赖用。
+//
+// 不能像以前那样把 props.tableMeta 的属性写进 watch 的数组源：setTableMeta 是
+// 整体替换 tab.tableMeta 对象，而 getter 每次返回新数组，Vue 用 Object.is 比较
+// 恒为"已变化"，于是任何一次元数据写入（打开表、手动刷新、后台索引加载完成）
+// 都会被误判成"换表了"，把 indexesLoaded/foreignKeysLoaded 清空并重新请求
+// listIndexes + listForeignKeys。慢链路（SSH 隧道 ~100ms RTT）下每次多发的这些
+// 请求都要新建一条数据库连接，代价是数秒。
+const tableMetadataIdentity = computed(() => JSON.stringify([props.connectionId ?? "", props.database ?? "", props.tableMeta?.catalog ?? "", props.tableMeta?.schema ?? "", props.tableMeta?.tableName ?? ""]));
+
+watch(tableMetadataIdentity, () => {
+  tableInfoColumns.value = props.tableMeta?.columns ?? [];
+  tableInfoColumnsLoading.value = false;
+  tableInfoColumnsRequestGeneration.value += 1;
+  tableOwner.value = null;
+  tableOwnerLoading.value = false;
+  tableOwnerError.value = "";
+  tableOwnerRequestGeneration.value += 1;
+  tableOverviewStats.value = null;
+  tableOverviewComment.value = null;
+  tableOverviewLoading.value = false;
+  tableOverviewLoaded.value = false;
+  tableOverviewRequestGeneration.value += 1;
+  rawDdlContent.value = "";
+  indexes.value = [];
+  indexesLoaded.value = false;
+  indexesLoading.value = false;
+  indexesError.value = "";
+  indexesRequestGeneration.value += 1;
+  foreignKeys.value = [];
+  foreignKeysLoaded.value = false;
+  foreignKeysLoading.value = false;
+  foreignKeysError.value = "";
+  foreignKeysRequestGeneration.value += 1;
+  triggers.value = [];
+  triggersLoaded.value = false;
+  triggersError.value = "";
+  constraints.value = [];
+  constraintsLoaded.value = false;
+  constraintsLoading.value = false;
+  constraintsError.value = "";
+  constraintsRequestGeneration.value += 1;
+  partitioning.value = null;
+  partitioningLoaded.value = false;
+  partitioningLoading.value = false;
+  partitioningError.value = "";
+  partitioningRequestGeneration.value += 1;
+  isPartitionedTable.value = false;
+  partitionStatusResolved.value = false;
+  // 表身份变更后，主动触发索引加载，确保索引指示器在切换表后立即可见
+  if (showIndexIndicatorsInHeader.value && canShowTableIndexes.value && currentIndexTableIdentity.value) {
+    void fetchIndexes();
+  }
+  if (props.autoShowTableInfo && props.tableMeta) showTableInfo.value = true;
+  if (showTableInfo.value) selectTableInfoTab(activeTableInfoTab.value);
+  if (showTableInfo.value) void fetchTableOwner();
+});
 
 watch(
   () => props.tableMeta?.columns,
@@ -11250,7 +11258,7 @@ function canvasCellForeignKey(rowIndex: number, actualColIdx: number): ForeignKe
 // 外键跳转按钮需要 FK 元数据：表身份就绪即后台加载（fetchForeignKeys 自带去重，
 // 上方 reset watch 先清旧表状态）
 watch(
-  () => [props.connectionId, props.database, props.tableMeta?.catalog, props.tableMeta?.schema, props.tableMeta?.tableName],
+  tableMetadataIdentity,
   () => {
     if (foreignKeyNavigationEnabled.value) void fetchForeignKeys();
   },

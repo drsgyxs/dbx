@@ -190,6 +190,33 @@ export function tableDataLargeValuePreviewOptions(databaseType: DatabaseType | u
   };
 }
 
+function postgresColumnNeedsLargeValuePreview(dataType: string): boolean {
+  const normalized = dataType.trim().toLocaleLowerCase();
+  // Array types have no `left(array, int)` overload; the backend skips them too.
+  if (normalized.includes("[")) return false;
+  const base = normalizedDataTypeBase(dataType);
+  if (base === "bytea") return true;
+  if (base === "char" || base === "character" || base === "varchar" || base === "text" || base === "citext" || base === "name") return true;
+  if (normalized.startsWith("character varying")) return true;
+  return base === "vector" || base === "json" || base === "jsonb" || base === "tsvector" || base === "xml";
+}
+
+/**
+ * Reports whether the canonical table projection (explicit column list with
+ * large-value preview wrapping) would return something a `SELECT *` cannot.
+ *
+ * Only mysql/postgres tables with primary keys get preview wrapping on the
+ * backend, so every other engine — Oracle included — produces exactly the same
+ * columns in the same order as `*`. Refresh can therefore use a star projection
+ * unless this returns `true`.
+ */
+export function tableDataNeedsCanonicalProjection(databaseType: DatabaseType | undefined, columns: readonly ColumnInfo[], primaryKeys: readonly string[], pageSize?: number): boolean {
+  if (!canUseTableDataLargeValuePreview(databaseType, columns, primaryKeys)) return false;
+  const keyColumns = new Set(primaryKeys.map((column) => column.toLocaleLowerCase()));
+  if (databaseType === "mysql") return mysqlPreviewBudget(columns, keyColumns, pageSize) !== null;
+  return columns.some((column) => !keyColumns.has(column.name.toLocaleLowerCase()) && postgresColumnNeedsLargeValuePreview(column.data_type));
+}
+
 export function largeValueCellKey(rowIndex: number, columnIndex: number): string {
   return `${rowIndex}:${columnIndex}`;
 }

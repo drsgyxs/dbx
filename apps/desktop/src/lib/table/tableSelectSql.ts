@@ -36,6 +36,17 @@ export interface BuildTableSelectSqlOptions {
   includeDatabaseName?: boolean;
   /** Omit optional identifier quotes while retaining quotes required by the dialect. */
   quoteIdentifiers?: boolean;
+  /**
+   * Star projection for data-tab refreshes: send no column list at all so the
+   * backend emits `SELECT *`. The statement then never references a column
+   * name, which keeps the query valid when another session added or dropped
+   * columns, and it lets the result itself report the latest column set.
+   *
+   * Large-value previews are derived from column types, so they cannot apply to
+   * a star projection: callers must confirm the table does not need them (see
+   * `tableDataNeedsCanonicalProjection`).
+   */
+  starProjection?: boolean;
 }
 
 const DATABASE_QUALIFIED_TABLE_TYPES = new Set<DatabaseType>(["mysql", "clickhouse", "doris", "starrocks", "goldendb"]);
@@ -448,5 +459,13 @@ export function requiresEagerTableMetadataForDataOpen(databaseType: DatabaseType
 
 export async function buildTableSelectSql(options: BuildTableSelectSqlOptions): Promise<string> {
   if (options.databaseType === "victoriametrics") return metricRangeQuery(options.tableName);
-  return api.buildTableSelectSql(options);
+  if (options.starProjection !== true) return api.buildTableSelectSql(options);
+  // Drop every column-derived option so the generated statement is a plain
+  // `SELECT *`: an empty column list is what makes the backend emit `*`
+  // (`build_select_columns` / `quoted_table_columns_or_star`).
+  const request: BuildTableSelectSqlOptions = { ...options, columns: [] };
+  delete request.columnTypes;
+  delete request.largeValuePreviewSize;
+  delete request.starProjection;
+  return api.buildTableSelectSql(request);
 }

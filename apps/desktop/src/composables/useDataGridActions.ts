@@ -6,9 +6,10 @@ import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { buildTableSelectSql, quoteTableDataIdentifier } from "@/lib/table/tableSelectSql";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
-import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
+import { tableDataLargeValuePreviewOptions, tableDataNeedsCanonicalProjection } from "@/lib/dataGrid/dataGridLargeValues";
+import { isProjectionRetryableError } from "@/lib/sql/columnChangeErrors";
 import { elasticsearchCursorPageJumpRequestCount } from "@/lib/dataGrid/dataGridPagination";
-import { editablePrimaryKeys, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
+import { columnsCarryRealPrimaryKey, editablePrimaryKeys, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
 import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
 import * as api from "@/lib/backend/api";
 import type { ColumnInfo, QueryTab } from "@/types/database";
@@ -107,7 +108,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     return typeof limit === "number" && limit > 0 ? { limit, offset: 0 } : undefined;
   }
 
-  function buildTableSql(tab: QueryTab, options: { orderBy?: string; limit?: number; offset?: number; whereInput?: string } = {}): Promise<string> {
+  function buildTableSql(tab: QueryTab, options: { orderBy?: string; limit?: number; offset?: number; whereInput?: string; starProjection?: boolean } = {}): Promise<string> {
     const config = connectionStore.getConfig(tab.connectionId);
     const effectiveDbType = effectiveDatabaseTypeForConnection(config);
     const tableMeta = tableMetaForDataTab(tab);
@@ -118,6 +119,10 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     // 真实列缺失时省略 columns 让 builder 生成 SELECT *
     const realColumns = tab.tableMeta?.columns.length ? tab.tableMeta.columns : undefined;
     const limit = options.limit ?? tableDataPageLimit(tab);
+    // 星号投影：语句里不出现任何列名，别人增删列后刷新依旧有效，且结果自带最新列
+    // 集合。大字段预览按列类型裁剪，星号投影无法表达，调用方需先用
+    // tableDataNeedsCanonicalProjection 确认该表不需要预览。
+    const starProjection = options.starProjection === true;
     return buildTableSelectSql({
       databaseType: effectiveDbType,
       driverProfile: config?.driver_profile,
@@ -127,13 +132,14 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       tableName: tableMeta?.tableName ?? "",
       tableType: tableMeta?.tableType,
       catalog: tableMeta?.catalog,
-      columns: realColumns?.map((column) => column.name),
+      columns: starProjection ? undefined : realColumns?.map((column) => column.name),
       primaryKeys,
-      ...tableDataLargeValuePreviewOptions(effectiveDbType, realColumns ?? [], primaryKeys, limit),
+      ...(starProjection ? {} : tableDataLargeValuePreviewOptions(effectiveDbType, realColumns ?? [], primaryKeys, limit)),
       includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
       includeRowId: useRowId,
       limit,
       injectDefaultTimeSeriesWhere: true,
+      starProjection,
       ...options,
     });
   }
@@ -186,7 +192,10 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
             force: options.force === true,
           });
           const primaryKeys = editablePrimaryKeys(effectiveDatabaseTypeForConnection(config), columns, target.tableType);
-          return { columns, primaryKeys, rowIdentityResolved: false };
+          // 列已带真实主键时行标识就是确定的：索引只可能提供"唯一索引回退"，
+          // 而那条路径在 primaryKeys 非空时根本不会走到。因此不必为了解除
+          // rowIdentityPending 再拉一次索引（慢链路上那是一条新连接 + 数秒往返）。
+          return { columns, primaryKeys, rowIdentityResolved: columnsCarryRealPrimaryKey(columns) };
         })()
       : await (async () => {
           const { metadata } = await loadTableMetadata({
@@ -288,6 +297,16 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
         if (incomingSortMissing) tab.orderByInput = undefined;
         const pageLimit = limit ?? tab.resultPageLimit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize);
         const pageOffset = offset ?? 0;
+        // 数据先呈现、元数据随后补齐（见下方首查路径选择）：这里保存后台元数据刷新的
+        // Promise，待它落地后再决定是否需要补一次规范投影查询。
+        let deferredMetadataRefresh: Promise<boolean> | undefined;
+        // 本次元数据的索引发现是否交给了延迟分支（星号投影路径）：下面判断行标识是否
+        // 已经确定时要区分几种路径，见 background-indexes 前的说明。
+        let metadataRefreshServedByColumnsOnly = false;
+        // 星号投影首查若命中"列变化 / 列级权限"类失败，由 handoffColumnChangeError 接管：
+        // 记下原始错误，待新列落地后用规范投影重试一次（重试失败才发布错误结果）。
+        let handedOffColumnChangeError: unknown;
+        let columnChangeRetryHandled = false;
         console.info("[DBX][reloadData:start]", {
           traceId,
           tabId: tab.id,
@@ -324,7 +343,13 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
         // Dameng 元数据必须与数据查询串行（同 useSidebarDataOpenRuntime），
         // 延后到查询完成后再启动。主动刷新和跨生命周期重建除外：必须先拿到新列再
         // 构建 SQL，否则第一次 toolbar reload 仍会沿用断链前的显式列列表。
-        const deferMetadataRefresh = intent !== "refresh" && !lifecycleStale && effectiveDatabaseTypeForConnection(connectionStore.getConfig(tab.connectionId)) === "dameng";
+        const effectiveDbType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(tab.connectionId));
+        const deferMetadataRefresh = intent !== "refresh" && !lifecycleStale && effectiveDbType === "dameng";
+        // 刷新首查用"列名无关"的星号投影：语句里不出现任何列名，所以别人新增/删除列后
+        // 刷新不会再先显示旧列、也不会因引用已删除的列而报错，结果自身就带回最新的列
+        // 集合与类型。唯一例外是大字段预览：它按列类型生成裁剪投影，星号投影无法表达，
+        // 这类表必须先拿到最新列与新类型再发一条规范投影查询（两条路径都只发一条查询）。
+        const starProjectionQuery = (intent === "refresh" || intent === "auto-refresh") && !lifecycleStale && hasRealTableMetaColumns && !tableDataNeedsCanonicalProjection(effectiveDbType, tab.tableMeta?.columns ?? [], tab.tableMeta?.primaryKeys ?? [], pageLimit);
         const startMetadataRefresh = () => {
           console.info("[DBX][reloadData:metadata:background:start]", { traceId, elapsed: elapsed(), reason: hasRealTableMetaColumns ? "stale" : "missing", metadataAgeMs });
           void refreshDataTabTableMeta(tab, { force: lifecycleStale, trace: { traceId, elapsed } })
@@ -334,6 +359,18 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
             .catch((e: any) => {
               console.warn("[DBX][reloadData:metadata:background:error]", { traceId, elapsed: elapsed(), error: e });
               toast(e?.message || String(e), 5000);
+            });
+        };
+        // 行标识没有被列确定时（无主键表 / 主键刚被删 / 索引发现失败）才做索引发现：
+        // 列已带真实主键时索引既不会改变行标识也不会改变 SELECT 投影，这次请求
+        // （慢链路上一整条新连接 + 数秒往返）可以整段省掉。
+        const startIndexDiscoveryRefresh = () => {
+          void refreshDataTabTableMeta(tab, { force: false, trace: { traceId, elapsed } })
+            .then(() => {
+              console.info("[DBX][reloadData:metadata:background-indexes:done]", { traceId, elapsed: elapsed() });
+            })
+            .catch((e: any) => {
+              console.warn("[DBX][reloadData:metadata:background-indexes:error]", { traceId, elapsed: elapsed(), error: e });
             });
         };
         if (lifecycleStale || intent === "refresh") {
@@ -362,14 +399,43 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
                 return;
               }
             }
-            // 手动刷新等待段只拉列（getColumns），不等 listIndexes：列投影决定
-            // 本次 SELECT 的正确性；主键/索引用旧值与新列求交，PK 名不进 SQL
-            // 文本（仅作大值预览保护集合），查询本身不受索引元数据延迟影响。
-            const rebuilt = await refreshDataTabTableMeta(tab, { force: true, columnsOnly: intent === "refresh" && !lifecycleStale && hasRealTableMetaColumns, trace: { traceId, elapsed } });
-            console.info("[DBX][reloadData:metadata:await:done]", { traceId, elapsed: elapsed(), rebuilt });
-            if (!rebuilt) {
-              stopPreparing();
-              return;
+            // 元数据是否移出关键路径由 starProjectionQuery 决定（见其定义）：
+            //  - 星号投影：首查不依赖列名，元数据完全后台跑，列/索引随后异步补齐
+            //  - 规范投影（仅大字段预览表）：必须先等新列与新类型，本次仍只发一条查询
+            // 高延迟链路（SSH 隧道 ~100ms RTT）上一次 getColumns 要数秒，串行等待会让
+            // "刷新数据"明显慢于直接执行同一条 SQL（DataGrip 刷新数据不发元数据请求）。
+            // 只有列缺失（没有可信投影）或跨生命周期重建才必须串行等待：
+            // 那时旧列可能来自断链前的会话，直接发查询会得到错误结果。
+            const metadataRefreshOffCriticalPath = intent === "refresh" && !lifecycleStale && hasRealTableMetaColumns;
+            if (metadataRefreshOffCriticalPath && starProjectionQuery) {
+              metadataRefreshServedByColumnsOnly = true;
+              deferredMetadataRefresh = refreshDataTabTableMeta(tab, { force: true, columnsOnly: true, trace: { traceId, elapsed } })
+                .then((rebuilt) => {
+                  console.info("[DBX][reloadData:metadata:await:done]", { traceId, elapsed: elapsed(), rebuilt, deferred: true });
+                  return rebuilt;
+                })
+                .catch((e: any) => {
+                  console.warn("[DBX][reloadData:metadata:await:error]", { traceId, elapsed: elapsed(), error: e });
+                  // 延迟路径不中止本次查询（星号投影不依赖列名），但失败必须让用户看到：
+                  // 否则"刷新成功但结构没更新"会变成一个静默的错误。
+                  toast(e?.message || String(e), 5000);
+                  return false;
+                });
+            } else if (metadataRefreshOffCriticalPath) {
+              // 大字段预览表：规范投影依赖最新列与新类型，串行取回后再构建 SQL
+              const rebuilt = await refreshDataTabTableMeta(tab, { force: true, columnsOnly: true, trace: { traceId, elapsed } });
+              console.info("[DBX][reloadData:metadata:await:done]", { traceId, elapsed: elapsed(), rebuilt, deferred: false });
+              if (!rebuilt) {
+                stopPreparing();
+                return;
+              }
+            } else {
+              const rebuilt = await refreshDataTabTableMeta(tab, { force: true, columnsOnly: false, trace: { traceId, elapsed } });
+              console.info("[DBX][reloadData:metadata:await:done]", { traceId, elapsed: elapsed(), rebuilt, deferred: false });
+              if (!rebuilt) {
+                stopPreparing();
+                return;
+              }
             }
           } catch (e: any) {
             console.warn("[DBX][reloadData:metadata:await:error]", { traceId, elapsed: elapsed(), error: e });
@@ -381,14 +447,12 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
           const rebuiltColumnNames = tab.tableMeta?.columns.map((column) => column.name) ?? [];
           incomingSortMissing = rebuiltColumnNames.length > 0 && simpleDataGridOrderByReferencesMissingColumn(orderBy, rebuiltColumnNames);
           if (incomingSortMissing) tab.orderByInput = undefined;
-          if (intent === "refresh" && !lifecycleStale) {
-            void refreshDataTabTableMeta(tab, { force: false, trace: { traceId, elapsed } })
-              .then(() => {
-                console.info("[DBX][reloadData:metadata:background-indexes:done]", { traceId, elapsed: elapsed() });
-              })
-              .catch((e: any) => {
-                console.warn("[DBX][reloadData:metadata:background-indexes:error]", { traceId, elapsed: elapsed(), error: e });
-              });
+          // 串行路径此刻已经拿回完整元数据，能直接判断行标识是否落定（未落定就等于
+          // 索引发现失败）→ 补一次索引发现。延迟路径不能在这里判断：它的新列还没到，
+          // 用刷新前的旧列判断会漏掉"这次刷新发现主键被删"的情况，让标签页永远解除
+          // 不了只读；那条路径的索引发现放在 deferredMetadataRefresh 的完成分支里。
+          if (intent === "refresh" && !lifecycleStale && !metadataRefreshServedByColumnsOnly && tab.tableMetaPending) {
+            startIndexDiscoveryRefresh();
           }
         } else if (shouldRefreshMetadata) {
           // 元数据缺失（如重启恢复的标签页只持久化了占位身份）时行标识未知：
@@ -401,8 +465,8 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
         }
         try {
           console.info("[DBX][reloadData:build-sql:start]", { traceId, elapsed: elapsed() });
-          const nextSql = await buildTableSql(tab, { whereInput, orderBy: incomingSortMissing ? undefined : orderBy, limit: pageLimit, offset: pageOffset });
-          console.info("[DBX][reloadData:build-sql:done]", { traceId, elapsed: elapsed() });
+          const nextSql = await buildTableSql(tab, { whereInput, orderBy: incomingSortMissing ? undefined : orderBy, limit: pageLimit, offset: pageOffset, starProjection: starProjectionQuery });
+          console.info("[DBX][reloadData:build-sql:done]", { traceId, elapsed: elapsed(), starProjection: starProjectionQuery });
           if (!stillCurrent() || connectionStore.metadataGenerationFor(tab.connectionId, tab.database) !== connectionGeneration) {
             stopPreparing();
             return;
@@ -412,13 +476,125 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
           await queryStore.executeTabSql(tab.id, nextSql, {
             pagination: { limit: pageLimit, offset: pageOffset },
             preserveResultDuringExecution: true,
+            // 星号投影失败时（列被别的会话删掉、账号只有列级 SELECT 权限）先不弹错误：
+            // 下面会用最新列重建规范投影重试一次，重试仍失败才发布错误结果。
+            ...(starProjectionQuery
+              ? {
+                  handoffColumnChangeError: (error: unknown) => {
+                    const config = connectionStore.getConfig(tab.connectionId);
+                    if (!isProjectionRetryableError(error, { databaseType: effectiveDbType, driverProfile: config?.driver_profile })) return false;
+                    handedOffColumnChangeError = error;
+                    return true;
+                  },
+                }
+              : {}),
           });
-          console.info("[DBX][reloadData:execute:done]", { traceId, elapsed: elapsed() });
+          console.info("[DBX][reloadData:execute:done]", { traceId, elapsed: elapsed(), handedOff: handedOffColumnChangeError !== undefined });
         } catch (e) {
           console.error("[DBX][reloadData:error]", { traceId, elapsed: elapsed(), error: e });
           stopPreparing();
           if (shouldRefreshMetadata && deferMetadataRefresh) startMetadataRefresh();
           throw e;
+        }
+        // 星号投影首查命中"列变化 / 列级权限"类失败：界面上不出现任何错误提示，
+        // 等新列落地后用规范投影重试一次（这次失败照常发布错误结果，属于断链、超时等
+        // 真实故障时也不会被掩盖）。重试结果即最新列与最新数据。
+        if (handedOffColumnChangeError !== undefined) {
+          columnChangeRetryHandled = true;
+          console.info("[DBX][reloadData:column-change-retry:start]", { traceId, elapsed: elapsed(), error: handedOffColumnChangeError });
+          let retryMetadataReady = false;
+          try {
+            retryMetadataReady = deferredMetadataRefresh ? await deferredMetadataRefresh : await refreshDataTabTableMeta(tab, { force: true, columnsOnly: true, trace: { traceId, elapsed } });
+          } catch (metadataError: any) {
+            console.warn("[DBX][reloadData:column-change-retry:metadata-error]", { traceId, elapsed: elapsed(), error: metadataError });
+          }
+          if (!retryMetadataReady) {
+            // 拿不到新列就无法保证重试语句合法（多半是连接层故障）：不能静默，
+            // 按原有方式把首查的错误呈现出来。
+            if (stillCurrent()) {
+              stopPreparing();
+              queryStore.setErrorResult(tab.id, handedOffColumnChangeError);
+            }
+            return;
+          }
+          if (!stillCurrent()) {
+            stopPreparing();
+            return;
+          }
+          queryStore.clearInvalidDataTabSort(tab.id);
+          const retryColumnNames = tab.tableMeta?.columns.map((column) => column.name) ?? [];
+          const retrySortMissing = retryColumnNames.length > 0 && simpleDataGridOrderByReferencesMissingColumn(orderBy, retryColumnNames);
+          if (retrySortMissing) tab.orderByInput = undefined;
+          try {
+            const retrySql = await buildTableSql(tab, {
+              whereInput,
+              orderBy: retrySortMissing ? undefined : orderBy,
+              limit: pageLimit,
+              offset: pageOffset,
+            });
+            if (!stillCurrent()) {
+              stopPreparing();
+              return;
+            }
+            queryStore.updateSql(tab.id, retrySql);
+            console.info("[DBX][reloadData:column-change-retry:execute:start]", { traceId, elapsed: elapsed() });
+            await queryStore.executeTabSql(tab.id, retrySql, {
+              pagination: { limit: pageLimit, offset: pageOffset },
+              preserveResultDuringExecution: true,
+            });
+            console.info("[DBX][reloadData:column-change-retry:execute:done]", { traceId, elapsed: elapsed() });
+          } catch (e) {
+            console.error("[DBX][reloadData:column-change-retry:error]", { traceId, elapsed: elapsed(), error: e });
+            stopPreparing();
+            throw e;
+          }
+        }
+        // 星号投影首查之后的收尾：元数据落地时只做三件事——补一次索引发现（行标识还没被
+        // 列确定时）、把编辑器里的 SQL 文本对齐到规范投影、以及在"本次才发现该表需要大字段
+        // 预览"这一罕见过渡下补一条规范投影查询。常规情况**不重跑**：首查结果本身就是最新
+        // 列与最新数据（路径判定已排除需要预览裁剪的表），用户已经省掉了 getColumns 的等待。
+        if (deferredMetadataRefresh) {
+          void deferredMetadataRefresh.then(async (rebuilt) => {
+            if (!rebuilt || !stillCurrent()) return;
+            // 新列到手后才判断行标识是否真的由列确定：列里没有真实主键（无主键表、
+            // 本次刷新发现主键被删、索引发现失败）时才需要索引发现提供唯一索引回退。
+            if (!columnsCarryRealPrimaryKey(tab.tableMeta?.columns ?? [])) {
+              startIndexDiscoveryRefresh();
+            }
+            // 列变化重试路径已经用规范投影重建并执行过语句：这里不再重复对齐 SQL 文本或
+            // 补跑查询，只保留上面的索引发现（行标识可能还需要唯一索引回退）。
+            if (columnChangeRetryHandled) return;
+            const refreshedColumnNames = tab.tableMeta?.columns.map((column) => column.name) ?? [];
+            const refreshedSortMissing = refreshedColumnNames.length > 0 && simpleDataGridOrderByReferencesMissingColumn(orderBy, refreshedColumnNames);
+            // 罕见过渡：旧元数据里没有需要裁剪的列，但本次新增的列恰是大字段（CLOB/BLOB
+            // 等）。星号投影的结果没有预览裁剪，补一条规范投影查询把大值收敛回来；下一次
+            // 刷新会直接走"等列 + 规范投影"路径，不再需要补跑。
+            const canonicalProjectionNeeded = tableDataNeedsCanonicalProjection(effectiveDbType, tab.tableMeta?.columns ?? [], tab.tableMeta?.primaryKeys ?? [], pageLimit);
+            try {
+              const sql = await buildTableSql(tab, {
+                whereInput,
+                orderBy: refreshedSortMissing ? undefined : orderBy,
+                limit: pageLimit,
+                offset: pageOffset,
+              });
+              if (!stillCurrent()) return;
+              if (!canonicalProjectionNeeded) {
+                // 常规路径：只把编辑器 SQL 文本对齐到规范投影，不重跑查询。后续分页/排序/
+                // 编辑都会用最新 tableMeta 重新生成 SQL，因此文本与数据始终一致。
+                if (!tab.isExecuting) queryStore.updateSql(tab.id, sql);
+                return;
+              }
+              queryStore.updateSql(tab.id, sql);
+              console.info("[DBX][reloadData:metadata:canonical-reexecute:start]", { traceId, elapsed: elapsed() });
+              await queryStore.executeTabSql(tab.id, sql, {
+                pagination: { limit: pageLimit, offset: pageOffset },
+                preserveResultDuringExecution: true,
+              });
+              console.info("[DBX][reloadData:metadata:canonical-reexecute:done]", { traceId, elapsed: elapsed() });
+            } catch (e: any) {
+              console.warn("[DBX][reloadData:metadata:canonical-reexecute:error]", { traceId, elapsed: elapsed(), error: e });
+            }
+          });
         }
         if (shouldRefreshMetadata && deferMetadataRefresh) startMetadataRefresh();
         return;

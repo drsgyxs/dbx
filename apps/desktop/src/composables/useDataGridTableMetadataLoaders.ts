@@ -4,6 +4,8 @@ import { applyDdlDatabaseQualifier, omitDdlIdentifierQuotes } from "@/lib/sql/dd
 import { sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
 import { loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { loadObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
+import { loadTableIndexes } from "@/lib/metadata/tableMetadataCache";
+import { metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { tableObjectSourceKind } from "@/lib/table/tableObjectSourceKind";
 import { columnIndexMetadataRequestCurrent, columnIndexTableIdentity } from "@/lib/dataGrid/dataGridColumnIndexIcon";
 import { foreignKeyMetadataRequestCurrent, foreignKeyTableIdentity } from "@/lib/dataGrid/dataGridForeignKeyNavigation";
@@ -112,6 +114,27 @@ export function useDataGridTableMetadataLoaders(options: DataGridTableMetadataLo
     };
   };
 
+  // 索引加载必须走 tableMetadataCache：打开表数据 / 刷新表数据那条路径
+  // （useSidebarDataOpenRuntime / useDataGridActions → loadTableMetadata）已经为这张
+  // 表拉过一次 listIndexes，只要 scope 字段完全一致就能命中同一份缓存（含在途
+  // Promise 去重），DataGrid 不再为同一张表多发一次请求。慢链路（SSH 隧道
+  // ~100ms RTT）上那一次多余请求就是一条新数据库连接 + 数秒往返。
+  const tableIndexRequest = () => {
+    const request = tableRequest();
+    if (!request || !props.connectionId) return undefined;
+    const config = options.connectionStore.getConfig(props.connectionId);
+    return {
+      connectionId: request.connectionId,
+      database: request.database,
+      schema: metadataSchemaForConnection(config, request.database, props.tableMeta?.schema),
+      tableName: request.tableName,
+      tableType: props.tableMeta?.tableType,
+      databaseType: options.resolvedDatabaseType.value ?? config?.db_type ?? "",
+      driverProfile: config?.driver_profile || config?.db_type,
+      catalog: request.catalog,
+    };
+  };
+
   const currentIndexTableIdentity = computed(() => currentTableIdentity("indexes"));
   const currentForeignKeyTableIdentity = computed(() => currentTableIdentity("foreignKeys"));
   const currentConstraintTableIdentity = computed(() => currentTableIdentity("constraints"));
@@ -187,7 +210,11 @@ export function useDataGridTableMetadataLoaders(options: DataGridTableMetadataLo
           requestIdentity,
           currentIdentity: currentTableIdentity("indexes"),
         }),
-      load: () => api.listIndexes(request.connectionId, request.database, request.schema, request.tableName, request.catalog),
+      load: async () => {
+        const indexRequest = tableIndexRequest();
+        if (!indexRequest) return [];
+        return loadTableIndexes(indexRequest);
+      },
       onSuccess: (value) => {
         state.indexes.value = value;
         state.indexesLoaded.value = true;
@@ -230,7 +257,8 @@ export function useDataGridTableMetadataLoaders(options: DataGridTableMetadataLo
           requestIdentity,
           currentIdentity: currentTableIdentity("foreignKeys"),
         }),
-      load: () => api.listForeignKeys(request.connectionId, request.database, request.schema, request.tableName, request.catalog),
+      // 同 indexes：外键元数据复用对象元数据缓存，避免与对象浏览器/表结构面板重复请求
+      load: () => loadObjectMetadataFacet(request, "foreign-keys", () => api.listForeignKeys(request.connectionId, request.database, request.schema, request.tableName, request.catalog)).then((result) => result.value),
       onSuccess: (value) => {
         state.foreignKeys.value = value;
         state.foreignKeysLoaded.value = true;

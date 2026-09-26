@@ -29,6 +29,20 @@ export function editablePrimaryKeys(databaseType: DatabaseType | undefined, colu
   return primaryKeys;
 }
 
+/**
+ * Whether the column metadata itself already carries a real primary key.
+ *
+ * When it does, row identity is fully determined by the columns: the index
+ * lookup inside `editableRowIdentifierColumns` is never consulted (see the
+ * early return when `primaryKeys.length > 0`). Callers use this to skip a
+ * `listIndexes` round trip that would otherwise be issued purely to un-gate row
+ * identity — on high-latency links (SSH tunnel, ~100ms RTT) that extra request
+ * costs a fresh database connection plus several seconds.
+ */
+export function columnsCarryRealPrimaryKey(columns: readonly Pick<ColumnInfo, "is_primary_key">[]): boolean {
+  return columns.some((column) => column.is_primary_key === true);
+}
+
 /** Physical primary keys only; unlike editable row identifiers, never fall back to unique indexes or synthetic keys. */
 export function physicalTablePrimaryKeys(columns: readonly Pick<ColumnInfo, "name" | "is_primary_key">[], indexes: readonly Pick<IndexInfo, "columns" | "is_primary">[] = []): string[] {
   const columnPrimaryKeys = columns.filter((column) => column.is_primary_key).map((column) => column.name);
